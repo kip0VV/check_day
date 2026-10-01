@@ -2,30 +2,141 @@ name: Daily Activity
 
 on:
   schedule:
-    # Понедельник–пятница, 09:00 UTC
+    # Понедельник–пятница, 09:00 UTC / 14:00 Екатеринбург
     - cron: "0 9 * * 1-5"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: daily-activity
+  cancel-in-progress: false
+
 jobs:
   daily-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          ref: main
 
-      - name: Update activity log
-        run: |
-          echo "- $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> activity.md
-
-      - name: Commit and push
+      - name: Configure Git
         run: |
           git config user.name "kip0VV"
           git config user.email "324505538+kip0VV@users.noreply.github.com"
 
+      - name: Update activity log
+        run: |
+          echo "- $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> activity.md
           git add activity.md
           git commit -m "chore: daily activity"
-          git push
+          git push origin HEAD:main
+
+      - name: Save crime news in Russian
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import subprocess
+          import time
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          from urllib.parse import urlencode, urlsplit
+
+          # Максимальное количество новостей за один запуск.
+          MAX_NEWS = 3
+
+          # Тематика и период поиска.
+          QUERY = (
+              '("ограбление" OR "задержали грабителей" '
+              'OR "поймали грабителя" OR "ограбление банка" '
+              'OR "задержали воров") when:7d'
+          )
+
+          FEED_URL = "https://news.google.com/rss/search?" + urlencode({
+              "q": QUERY,
+              "hl": "ru",
+              "gl": "RU",
+              "ceid": "RU:ru",
+          })
+
+          def git(*args):
+              subprocess.run(["git", *args], check=True)
+
+          # Повторяем загрузку при временной ошибке.
+          for attempt in range(3):
+              try:
+                  request = urllib.request.Request(
+                      FEED_URL,
+                      headers={"User-Agent": "DailyNewsArchive/1.0"},
+                  )
+                  with urllib.request.urlopen(
+                      request, timeout=30
+                  ) as response:
+                      root = ET.fromstring(response.read())
+
+                  if root.find("channel") is None:
+                      raise RuntimeError("Сервис вернул некорректную RSS-ленту")
+                  break
+              except Exception:
+                  if attempt == 2:
+                      raise
+                  time.sleep(5)
+
+          items = root.findall("./channel/item")
+          folder = Path("news")
+          folder.mkdir(exist_ok=True)
+          saved = 0
+
+          for item in items:
+              title = " ".join(
+                  (item.findtext("title") or "").split()
+              )
+              link = (item.findtext("link") or "").strip()
+              published = (
+                  item.findtext("pubDate") or "Не указана"
+              ).strip()
+              source = (
+                  item.findtext("source") or "Google Новости"
+              ).strip()
+
+              if not title or not link:
+                  continue
+
+              if urlsplit(link).scheme not in ("https", "http"):
+                  continue
+
+              # Постоянный идентификатор защищает от повторов
+              # одной и той же записи RSS.
+              identity = (item.findtext("guid") or link).strip()
+              article_id = hashlib.sha256(
+                  identity.encode("utf-8")
+              ).hexdigest()
+              path = folder / f"{article_id}.txt"
+
+              if path.exists():
+                  continue
+
+              path.write_text(
+                  f"{title}\n\n"
+                  f"Источник: {source}\n"
+                  f"Дата публикации: {published}\n"
+                  f"Ссылка: {link}\n",
+                  encoding="utf-8",
+              )
+
+              # Каждая новость сохраняется отдельным коммитом.
+              git("add", str(path))
+              git("commit", "-m", f"news: {title[:120]}")
+              git("push", "origin", "HEAD:main")
+
+              saved += 1
+              if saved >= MAX_NEWS:
+                  break
+
+          print(f"Добавлено новостей: {saved}")
+          PY
